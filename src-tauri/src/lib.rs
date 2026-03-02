@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tauri::{command, Manager};
+// use tauri::Window;     // ← ADD Emitter here
 
 // -----------------------------
 // Helpers
@@ -55,12 +56,13 @@ fn greet(name: &str) -> String {
 fn import_reimagined_data(
     app: tauri::AppHandle,
     data_dir: String,
+    window: tauri::Window,           // ← NEW: window for progress events
 ) -> Result<importer::ImportSummary, String> {
     let data_dir = PathBuf::from(data_dir);
-
     let db_path = db_path(&app)?;
 
-    importer::import_txt_tables_to_sqlite(&data_dir, &db_path).map_err(|e| e.to_string())
+    importer::import_txt_tables_to_sqlite(&data_dir, &db_path, window)
+        .map_err(|e| e.to_string())
 }
 
 #[command]

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { listen } from '@tauri-apps/api/event';
 
   let status = "Idle";
   let tables: string[] = [];
@@ -21,6 +22,8 @@
   let showImportDetails = false;
   let showStringErrors = true;
 
+  let progressMessage = '';
+
   onMount(async () => {
     status = "Loading Tauri APIs...";
     const dialog = await import("@tauri-apps/plugin-dialog");
@@ -28,6 +31,11 @@
     openDialog = dialog.open;
     invokeCmd = core.invoke;
     status = "Ready ✅";
+    // Live import progress listener
+    const unlistenProgress = await listen('import_progress', (event: any) => {
+        const { current, total } = event.payload as { current: number; total: number };
+        progressMessage = `Importing ${current} of ${total} tables...`;
+    });
 
     await refreshTables();
   });
@@ -59,7 +67,7 @@
     }
   }
 
-  async function importData() {
+async function importData() {
     if (!openDialog || !invokeCmd) return;
 
     const folder = await openDialog({
@@ -74,8 +82,12 @@
     }
 
     status = "Importing...";
+    progressMessage = '';                    // ← NEW
     try {
-      const sum = await invokeCmd("import_reimagined_data", { dataDir: folder });
+      const sum = await invokeCmd("import_reimagined_data", { 
+        dataDir: folder,
+        window: null   // Tauri auto-injects window, we just need the param
+      });
       lastImport = sum;
 
       const tablesCount = sum?.imported?.length ?? 0;
@@ -83,11 +95,13 @@
       const stringErrors = sum?.strings_errors?.length ?? 0;
 
       status = `Imported ✅ Tables: ${tablesCount}, Strings: ${stringsCount} (errors: ${stringErrors})`;
+      progressMessage = '';                  // ← NEW
       await refreshTables();
     } catch (e) {
       status = "Import error: " + String(e);
+      progressMessage = '';                  // ← NEW
     }
-  }
+}
 
   function buildVisibleColumns() {
     // If we have no columns yet, nothing to build
@@ -333,6 +347,9 @@
   </div>
 
   <p>Status: {status}</p>
+  {#if progressMessage}
+    <p style="color: #4ade80; font-weight: bold;">{progressMessage}</p>
+  {/if}
   <p>Rows loaded: {rows.length}</p>
   <p>Rows after filter: {filteredRows().length}</p>
 

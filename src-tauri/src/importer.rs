@@ -7,6 +7,13 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+use tauri::{Emitter, Window};
+
+#[derive(Clone, serde::Serialize)]
+struct ImportProgress {
+    current: usize,
+    total: usize,
+}
 
 #[derive(Debug, serde::Serialize)]
 pub struct ImportSummary {
@@ -25,7 +32,11 @@ pub struct TableInfo {
     pub cols: u64,
 }
 
-pub fn import_txt_tables_to_sqlite(data_dir: &Path, db_path: &Path) -> Result<ImportSummary> {
+pub fn import_txt_tables_to_sqlite(
+    data_dir: &Path,
+    db_path: &Path,
+    window: Window,                     // ← NEW: window param
+) -> Result<ImportSummary> {
     if !data_dir.exists() {
         return Err(anyhow!("Data directory does not exist: {}", data_dir.display()));
     }
@@ -45,33 +56,17 @@ pub fn import_txt_tables_to_sqlite(data_dir: &Path, db_path: &Path) -> Result<Im
         "#,
     )?;
 
-    // Prefer non-/base/ file if both exist.
     let mut best_files: HashMap<String, PathBuf> = HashMap::new();
 
     for entry in WalkDir::new(data_dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
+        if !entry.file_type().is_file() { continue; }
         let path = entry.path().to_path_buf();
-        let is_txt = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.eq_ignore_ascii_case("txt"))
-            == Some(true);
+        let is_txt = path.extension().and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("txt")) == Some(true);
+        if !is_txt { continue; }
 
-        if !is_txt {
-            continue;
-        }
-
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-
-        if stem.is_empty() {
-            continue;
-        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        if stem.is_empty() { continue; }
 
         let table_key = sanitize_table_name(&stem);
 
@@ -79,14 +74,10 @@ pub fn import_txt_tables_to_sqlite(data_dir: &Path, db_path: &Path) -> Result<Im
             || path.to_string_lossy().to_lowercase().contains("/base/");
 
         match best_files.get(&table_key) {
-            None => {
-                best_files.insert(table_key, path);
-            }
+            None => { best_files.insert(table_key, path); }
             Some(existing) => {
                 let old_is_base = existing.to_string_lossy().to_lowercase().contains("\\base\\")
                     || existing.to_string_lossy().to_lowercase().contains("/base/");
-
-                // Keep non-base over base
                 if old_is_base && !new_is_base {
                     best_files.insert(table_key, path);
                 }
@@ -96,15 +87,21 @@ pub fn import_txt_tables_to_sqlite(data_dir: &Path, db_path: &Path) -> Result<Im
 
     let mut imported = Vec::new();
     let mut skipped = Vec::new();
+    let total = best_files.len();
 
     for (_table_key, path) in best_files.iter() {
         match import_one_txt(&mut conn, path) {
             Ok(table_info) => imported.push(table_info),
             Err(e) => skipped.push(format!("{} :: {}", path.display(), e)),
         }
+
+        // === LIVE PROGRESS EMIT ===
+        let _ = window.emit("import_progress", ImportProgress {
+            current: imported.len(),
+            total,
+        });
     }
 
-    // --- Strings import (JSON) ---
     let (strings_imported, strings_errors) = import_strings_json(&mut conn, data_dir)?;
 
     Ok(ImportSummary {
@@ -310,10 +307,8 @@ fn import_strings_json(conn: &mut Connection, data_dir: &Path) -> Result<(u64, V
                 continue;
             }
         };
-        
         // Strip BOM if present before parsing JSON
         let text = text.trim_start_matches('\u{feff}').to_string();
-
         let parsed: Result<Vec<StringRow>, _> = serde_json::from_str(&text);
         let rows = match parsed {
             Ok(r) => r,
