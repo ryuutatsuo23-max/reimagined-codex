@@ -310,6 +310,9 @@ fn import_strings_json(conn: &mut Connection, data_dir: &Path) -> Result<(u64, V
                 continue;
             }
         };
+        
+        // Strip BOM if present before parsing JSON
+        let text = text.trim_start_matches('\u{feff}').to_string();
 
         let parsed: Result<Vec<StringRow>, _> = serde_json::from_str(&text);
         let rows = match parsed {
