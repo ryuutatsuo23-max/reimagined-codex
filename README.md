@@ -1,6 +1,6 @@
-# Tauri + SvelteKit + TypeScript
+# Reimagined Codex
 
-This template should help get you started developing with Tauri, SvelteKit and TypeScript in Vite.
+Desktop tool for importing Reimagined game data into a local SQLite database, then browsing, filtering, and inspecting the extracted tables and string entries through a simple UI.
 
 ## Recommended IDE Setup
 

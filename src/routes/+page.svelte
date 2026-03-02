@@ -1,162 +1,120 @@
 <script lang="ts">
   import { onMount } from "svelte";
 
-  // Tauri invoke + dialog (wired at runtime)
+  // ---------- Tauri invoke ----------
   let invokeCmd: ((cmd: string, args?: any) => Promise<any>) | null = null;
-  let openDialog: ((opts: any) => Promise<string | string[] | null>) | null = null;
 
-  // UI state
-  let status = "Loading…";
-  let lastImport: any = null;
-
+  // ---------- UI state ----------
+  let status = "Booting…";
   let tables: string[] = [];
-  let selected = "uniqueitems";
-
+  let selected = "";
   let rows: any[] = [];
+
   let allColumns: string[] = [];
   let visibleColumns: string[] = [];
 
   let search = "";
   let compact = true;
 
-  // Raw props toggle (if true, show prop1/par1/min1… columns; if false, hide them)
-  let showRawProps = false;
+  // Option B: curated columns + hide prop/min/max families
+  let showAllColumns = false; // curated by default
+  let showRawProps = false;   // if ON: include prop/min/max columns and show raw text
 
-  // Sticky toggles
   let stickyIndex = true;
   let stickyMods = true;
 
-  // Option B: curated columns by default
-  let showAllColumns = false;
+  // ---------- helpers ----------
+  function isPropFamily(col: string): boolean {
+    // prop1..prop12, par1..par12, min1..min12, max1..max12
+    return /^(prop|par|min|max)\d+$/i.test(col);
+  }
 
-  const MODS_COL = "mods";
+  function computeVisibleColumns(cols: string[]): string[] {
+    // Always keep mods visible if we have it in the list
+    if (showAllColumns) {
+      // If raw props OFF, still hide prop-family columns
+      return cols.filter((c) => (showRawProps ? true : !isPropFamily(c)));
+    }
 
-  // Optional: hide a few noisy/system columns too (only when showAllColumns=false)
-  const SYSTEM_HIDE = new Set(
-    [
+    // Curated set
+    const baseCompact = [
+      "index",
+      "code",
+      "lvl",
+      "rarity",
+      "lvl_req",
+      "itemname",
+      "invfile",
+      "carry1",
+      "cost_add",
+      "cost_mult",
+      "mods"
+    ];
+
+    const baseWideExtra = [
       "id",
       "version",
-      "enabled",
       "disabled",
       "spawnable",
-      "disablechronicle",
-      "dropconditionalc",
       "firstladderseason",
       "lastladderseason",
-      "nolimit"
-    ].map((x) => x.toLowerCase())
-  );
+      "nolimit",
+      "chrtransform",
+      "invtransform",
+      "flippyfile",
+      "dropsound",
+      "dropsfxframe",
+      "usesound"
+    ];
 
-  const isRawPropCol = (c: string) =>
-    /^prop\d+$/i.test(c) || /^par\d+$/i.test(c) || /^min\d+$/i.test(c) || /^max\d+$/i.test(c);
+    const keep = new Set<string>(compact ? baseCompact : [...baseCompact, ...baseWideExtra]);
+
+    return cols.filter((c) => {
+      if (c === "mods") return true;
+      if (!showRawProps && isPropFamily(c)) return false;
+      return keep.has(c);
+    });
+  }
+
+  function formatCell(r: any, c: string): string {
+    const v = r?.[c];
+    if (v === null || v === undefined || v === "") return "—";
+    if (Array.isArray(v)) return v.join(", ");
+    return String(v);
+  }
 
   function filteredRows(): any[] {
-    const q = (search ?? "").toString().trim().toLowerCase();
+    const q = search.trim().toLowerCase();
     if (!q) return rows;
 
     return rows.filter((r) =>
       visibleColumns.some((c) => {
         const v = r?.[c];
-
-        if (c === MODS_COL) {
-          if (Array.isArray(v)) return v.join(" ").toLowerCase().includes(q);
-          return (v ?? "").toString().toLowerCase().includes(q);
-        }
-
-        return (v ?? "").toString().toLowerCase().includes(q);
+        if (v === null || v === undefined) return false;
+        if (Array.isArray(v)) return v.join("\n").toLowerCase().includes(q);
+        return String(v).toLowerCase().includes(q);
       })
     );
   }
 
-  function formatCell(r: any, c: string): string {
-    const v = r?.[c];
-    if (v === null || v === undefined) return "—";
-    if (typeof v === "string" && v.trim() === "") return "—";
-    if (Array.isArray(v)) return v.join(", ");
-    return String(v);
-  }
-
-  // ✅ Option B column picker
-  // - Always keeps key columns
-  // - Hides prop/par/min/max unless Raw Props is ON
-  // - Hides a few system columns unless "All Columns" is ON
-  // - Ensures mods exists and is placed at the end
-  function pickVisibleColumns(cols: string[]): string[] {
-    const lowerMap = new Map(cols.map((c) => [c.toLowerCase(), c]));
-    const getCol = (name: string) => lowerMap.get(name.toLowerCase());
-
-    const basePreferred = ["index", "code", "lvl", "rarity", "invfile", "carry1", "cost_add", "cost_mult"];
-
-    // Start with either compact preferred list, or everything
-    let out: string[] = [];
-
-    if (compact) {
-      for (const k of basePreferred) {
-        const hit = getCol(k);
-        if (hit) out.push(hit);
-      }
-    } else {
-      out = [...cols];
-    }
-
-    // Remove raw prop plumbing if raw props is OFF
-    if (!showRawProps) {
-      out = out.filter((c) => !isRawPropCol(c));
-    }
-
-    // Curated mode: hide system-ish columns
-    if (!showAllColumns) {
-      out = out.filter((c) => !SYSTEM_HIDE.has(c.toLowerCase()));
-    }
-
-    // Ensure uniqueness (preserve order)
-    const seen = new Set<string>();
-    out = out.filter((c) => {
-      const key = c.toLowerCase();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-    // ✅ Always append mods at the end (even if not part of table_columns)
-    out = out.filter((c) => c.toLowerCase() !== MODS_COL);
-    out.push(MODS_COL);
-
-    // Fallback if compact mode found almost nothing
-    if (out.length <= 1) {
-      const fallback = cols
-        .filter((c) => (showRawProps ? true : !isRawPropCol(c)))
-        .filter((c) => (showAllColumns ? true : !SYSTEM_HIDE.has(c.toLowerCase())))
-        .slice(0, 12);
-
-      const uniq: string[] = [];
-      const s2 = new Set<string>();
-      for (const c of fallback) {
-        const k = c.toLowerCase();
-        if (s2.has(k)) continue;
-        s2.add(k);
-        uniq.push(c);
-      }
-
-      // keep mods last
-      return [...uniq.filter((c) => c.toLowerCase() !== MODS_COL), MODS_COL];
-    }
-
-    return out;
-  }
-
   function recomputeColumnsOnly() {
-    visibleColumns = pickVisibleColumns(allColumns);
+    visibleColumns = computeVisibleColumns(allColumns);
   }
 
-  function clearFilter() {
-    search = "";
-    status = `Showing ${rows.length} rows from ${selected}`;
-  }
-
-  async function resolveVisibleKeys() {
-    // Placeholder for later (string resolving per visible table)
-    status = "Resolve Visible Keys ✅ (UI hook ready — backend wiring later)";
+  // ---------- backend calls ----------
+  async function importData() {
+    if (!invokeCmd) {
+      status = "Tauri invoke not found. Are you running inside the app?";
+      return;
+    }
+    try {
+      status = "Importing…";
+      await invokeCmd("import_reimagined_data");
+      await refreshTables();
+      status = "Import complete ✅";
+    } catch (e) {
+      status = `Import error: ${String(e)}`;
+    }
   }
 
   async function refreshTables() {
@@ -164,14 +122,19 @@
       status = "Tauri invoke not found. Are you running inside the app?";
       return;
     }
-
     try {
+      status = "Refreshing tables…";
       tables = await invokeCmd("list_tables");
-      if (!tables.includes(selected)) selected = tables[0] ?? "uniqueitems";
-      status = `Loaded ${tables.length} tables`;
+      if (!selected && tables.length) {
+        selected = tables.includes("uniqueitems") ? "uniqueitems" : tables[0];
+      }
       await loadPreview();
     } catch (e) {
       status = `Refresh tables error: ${String(e)}`;
+      tables = [];
+      rows = [];
+      allColumns = [];
+      visibleColumns = [];
     }
   }
 
@@ -185,49 +148,35 @@
     try {
       status = `Loading ${selected}…`;
 
-      // fetch columns first
+      // 1) DB columns
       const cols: string[] = await invokeCmd("table_columns", { table: selected });
-      allColumns = cols;
-      visibleColumns = pickVisibleColumns(cols);
 
-      // fetch rows
+      // 2) Preview rows (this is where "mods" is computed)
       rows = await invokeCmd("preview_table", {
         table: selected,
         limit: 50,
         rawProps: showRawProps
       });
 
+      // 3) Build column list:
+      //    - start from DB cols
+      //    - hide prop-family later via computeVisibleColumns
+      //    - IMPORTANT: add "mods" if rows include it (it's not in DB schema)
+      const colSet = new Set(cols);
+      if (!colSet.has("mods")) {
+        // if ANY row has mods, add it
+        if (rows.some((r: any) => r && "mods" in r)) colSet.add("mods");
+      }
+
+      allColumns = Array.from(colSet);
+      visibleColumns = computeVisibleColumns(allColumns);
+
       status = `Showing ${rows.length} rows from ${selected}`;
     } catch (e) {
       status = `Load error for ${selected}: ${String(e)}`;
       rows = [];
-    }
-  }
-
-  async function importData() {
-    if (!invokeCmd || !openDialog) {
-      status = "Tauri invoke not found. Are you running inside the app?";
-      return;
-    }
-
-    try {
-      const dir = await openDialog({
-        directory: true,
-        multiple: false,
-        title: "Select the Reimagined.mpq/data folder"
-      });
-
-      if (!dir || typeof dir !== "string") {
-        status = "Import cancelled.";
-        return;
-      }
-
-      status = "Importing…";
-      lastImport = await invokeCmd("import_reimagined_data", { baseDir: dir });
-      status = "Import complete ✅";
-      await refreshTables();
-    } catch (e) {
-      status = `Import error: ${String(e)}`;
+      allColumns = [];
+      visibleColumns = [];
     }
   }
 
@@ -244,18 +193,92 @@
     }
   }
 
+  // ✅ Resolve visible keys via lookup_strings (no special backend command required)
+  async function resolveVisibleKeys() {
+    if (!invokeCmd) {
+      status = "Tauri invoke not found. Are you running inside the app?";
+      return;
+    }
+    if (!rows.length) {
+      status = "No rows loaded.";
+      return;
+    }
+
+    try {
+      status = "Resolving visible keys…";
+
+      // Gather key-like strings from visible columns (excluding mods)
+      const keys = new Set<string>();
+
+      for (const r of rows) {
+        for (const c of visibleColumns) {
+          if (c === "mods") continue;
+          const v = r?.[c];
+          if (typeof v === "string") {
+            const s = v.trim();
+            // heuristic: ignore obvious non-keys
+            if (!s) continue;
+            if (s.length > 80) continue;
+            if (/^\d+$/.test(s)) continue;
+            keys.add(s);
+          }
+        }
+      }
+
+      if (!keys.size) {
+        status = "No string keys found in visible cells.";
+        return;
+      }
+
+      const locale = "enUS"; // or undefined
+      const map: Record<string, string> = await invokeCmd("lookup_strings", {
+        keys: Array.from(keys),
+        locale
+      });
+
+      // Replace values in-place where we have a lookup hit
+      rows = rows.map((r) => {
+        const nr = { ...r };
+        for (const c of visibleColumns) {
+          if (c === "mods") continue;
+          const v = nr?.[c];
+          if (typeof v === "string") {
+            const hit = map[v];
+            if (hit && hit.trim().length) nr[c] = hit;
+          }
+        }
+        return nr;
+      });
+
+      status = `Resolved ${Object.keys(map).length} keys ✅`;
+    } catch (e) {
+      status = `Resolve keys error: ${String(e)}`;
+    }
+  }
+
+  // Use your existing backend command (debug_table_schema)
+  async function debugStringsSchema() {
+    if (!invokeCmd) {
+      status = "Tauri invoke not found. Are you running inside the app?";
+      return;
+    }
+    try {
+      const cols: string[] = await invokeCmd("debug_table_schema", { table: "strings" });
+      status = `strings columns: ${cols.join(", ")}`;
+    } catch (e) {
+      status = `schema error: ${String(e)}`;
+    }
+  }
+
+  // ---------- init ----------
   onMount(async () => {
     try {
-      // ✅ Use official API (dynamic import so SSR never touches it)
       const core = await import("@tauri-apps/api/core");
       invokeCmd = core.invoke;
-
-      const dialog = await import("@tauri-apps/plugin-dialog");
-      openDialog = dialog.open;
-
-      status = "Ready ✅";
+      status = "Tauri ready ✅";
       await refreshTables();
-    } catch (e) {
+    } catch {
+      invokeCmd = null;
       status = "Tauri invoke not found. Are you running inside the app?";
     }
   });
@@ -280,21 +303,7 @@
       Toggle Compact/Wide
     </button>
 
-    <button on:click={async () => {
-      if (!invokeCmd) {
-        status = "Tauri invoke not ready yet.";
-        return;
-      }
-
-      try {
-        const cols = await invokeCmd("debug_strings_schema");
-        status = `strings columns: ${cols.join(", ")}`;
-      } catch (e) {
-        status = `schema error: ${String(e)}`;
-      }
-    }}>
-      Debug Strings Schema
-    </button>
+    <button on:click={debugStringsSchema}>Debug Strings Schema</button>
 
     <span class="pill">Columns: {showAllColumns ? "All" : "Curated"}</span>
     <button
@@ -308,10 +317,9 @@
 
     <span class="pill">Raw props: {showRawProps ? "On" : "Off"}</span>
     <button
-      on:click={() => {
+      on:click={async () => {
         showRawProps = !showRawProps;
-        // raw props affects backend data too, so reload
-        loadPreview();
+        await loadPreview();
       }}
     >
       Toggle Raw Props
@@ -325,7 +333,8 @@
 
     <label style="margin-left: 12px;" for="filterInput">Filter:</label>
     <input id="filterInput" name="filterInput" bind:value={search} placeholder="type to filter…" />
-    <button on:click={clearFilter}>Clear Filter</button>
+
+    <button on:click={() => (search = "")}>Clear Filter</button>
 
     <label style="margin-left: 12px;" for="tableSelect">Table:</label>
     <select id="tableSelect" name="tableSelect" bind:value={selected} on:change={loadPreview}>
@@ -335,17 +344,8 @@
     </select>
   </div>
 
-  <p style="margin-top: 10px;">Status: {status}</p>
+  <p style="margin-top: 10px;"><b>Status:</b> {status}</p>
   <p>Rows loaded: {rows.length} | Rows after filter: {filteredRows().length}</p>
-
-  <h2>Last Import</h2>
-  {#if lastImport}
-    <pre style="max-height: 240px; overflow: auto; border: 1px solid #333; padding: 8px;">
-{JSON.stringify(lastImport, null, 2)}
-    </pre>
-  {:else}
-    <p>(No import yet)</p>
-  {/if}
 
   {#if filteredRows().length}
     <div class="tableWrap">
@@ -353,7 +353,10 @@
         <thead>
           <tr>
             {#each visibleColumns as c}
-              <th class:stickyLeftTh={stickyIndex && c === "index"} class:stickyRightTh={stickyMods && c === "mods"}>
+              <th
+                class:stickyLeftTh={stickyIndex && c === "index"}
+                class:stickyRightTh={stickyMods && c === "mods"}
+              >
                 {c}
               </th>
             {/each}
@@ -367,7 +370,6 @@
                 <td
                   class:stickyLeftTd={stickyIndex && c === "index"}
                   class:stickyRightTd={stickyMods && c === "mods"}
-                  class:modsCell={c === "mods"}
                 >
                   {#if c === "mods" && Array.isArray(r?.mods) && !showRawProps}
                     <div class="mods">
@@ -434,53 +436,40 @@
     position: sticky;
     top: 0;
     background: #111;
-    color: #fff;
-    z-index: 5;
+    color: white;
+    z-index: 2;
   }
 
-  .stickyLeftTh {
-    position: sticky;
-    left: 0;
-    z-index: 7;
-    background: #111;
-    color: #fff;
-  }
-
+  .stickyLeftTh,
   .stickyLeftTd {
     position: sticky;
     left: 0;
-    z-index: 6;
-    background: #fff;
+    background: white;
+    z-index: 3;
   }
 
-  .stickyRightTh {
-    position: sticky;
-    right: 0;
-    z-index: 7;
+  .stickyLeftTh {
     background: #111;
-    color: #fff;
+    color: white;
+    z-index: 4;
   }
 
+  .stickyRightTh,
   .stickyRightTd {
     position: sticky;
     right: 0;
-    z-index: 6;
-    background: #fff;
+    background: white;
+    z-index: 3;
   }
 
-  .modsCell {
-    white-space: normal;
-    min-width: 280px;
-    max-width: 520px;
+  .stickyRightTh {
+    background: #111;
+    color: white;
+    z-index: 4;
   }
 
   .mods ul {
-    list-style: none;
     margin: 0;
-    padding: 0;
-  }
-
-  .mods li {
-    margin-bottom: 2px;
+    padding-left: 16px;
   }
 </style>
