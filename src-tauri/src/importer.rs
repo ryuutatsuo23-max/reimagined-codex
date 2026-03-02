@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 use tauri::{Emitter, Window};
+use walkdir::WalkDir;
 
 #[derive(Clone, serde::Serialize)]
 struct ImportProgress {
@@ -35,10 +35,13 @@ pub struct TableInfo {
 pub fn import_txt_tables_to_sqlite(
     data_dir: &Path,
     db_path: &Path,
-    window: Window,                     // ← NEW: window param
+    window: Window, // ← window param
 ) -> Result<ImportSummary> {
     if !data_dir.exists() {
-        return Err(anyhow!("Data directory does not exist: {}", data_dir.display()));
+        return Err(anyhow!(
+            "Data directory does not exist: {}",
+            data_dir.display()
+        ));
     }
 
     if let Some(parent) = db_path.parent() {
@@ -59,14 +62,27 @@ pub fn import_txt_tables_to_sqlite(
     let mut best_files: HashMap<String, PathBuf> = HashMap::new();
 
     for entry in WalkDir::new(data_dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() { continue; }
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let path = entry.path().to_path_buf();
-        let is_txt = path.extension().and_then(|s| s.to_str())
-            .map(|s| s.eq_ignore_ascii_case("txt")) == Some(true);
-        if !is_txt { continue; }
+        let is_txt = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("txt"))
+            == Some(true);
+        if !is_txt {
+            continue;
+        }
 
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-        if stem.is_empty() { continue; }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if stem.is_empty() {
+            continue;
+        }
 
         let table_key = sanitize_table_name(&stem);
 
@@ -74,10 +90,18 @@ pub fn import_txt_tables_to_sqlite(
             || path.to_string_lossy().to_lowercase().contains("/base/");
 
         match best_files.get(&table_key) {
-            None => { best_files.insert(table_key, path); }
+            None => {
+                best_files.insert(table_key, path);
+            }
             Some(existing) => {
-                let old_is_base = existing.to_string_lossy().to_lowercase().contains("\\base\\")
-                    || existing.to_string_lossy().to_lowercase().contains("/base/");
+                let old_is_base = existing
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains("\\base\\")
+                    || existing
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains("/base/");
                 if old_is_base && !new_is_base {
                     best_files.insert(table_key, path);
                 }
@@ -89,17 +113,23 @@ pub fn import_txt_tables_to_sqlite(
     let mut skipped = Vec::new();
     let total = best_files.len();
 
+    let mut processed: usize = 0;
     for (_table_key, path) in best_files.iter() {
         match import_one_txt(&mut conn, path) {
             Ok(table_info) => imported.push(table_info),
             Err(e) => skipped.push(format!("{} :: {}", path.display(), e)),
         }
 
+        processed += 1;
+
         // === LIVE PROGRESS EMIT ===
-        let _ = window.emit("import_progress", ImportProgress {
-            current: imported.len(),
-            total,
-        });
+        let _ = window.emit(
+            "import_progress",
+            ImportProgress {
+                current: processed,
+                total,
+            },
+        );
     }
 
     let (strings_imported, strings_errors) = import_strings_json(&mut conn, data_dir)?;
@@ -210,12 +240,12 @@ fn import_from_reader(
         .collect::<Vec<_>>()
         .join(", ");
 
-    conn.execute(
-        &format!("CREATE TABLE \"{}\" ({});", table_name, cols_sql),
-        [],
-    )?;
+    conn.execute(&format!("CREATE TABLE \"{}\" ({});", table_name, cols_sql), [])?;
 
-    let placeholders = (0..col_names.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+    let placeholders = (0..col_names.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
     let insert_sql = format!(
         "INSERT INTO \"{}\" ({}) VALUES ({});",
         table_name,
@@ -266,10 +296,7 @@ struct StringRow {
 
 /// Imports strings from: data/local/lng/strings/*.json
 fn import_strings_json(conn: &mut Connection, data_dir: &Path) -> Result<(u64, Vec<String>)> {
-    let strings_dir = data_dir
-        .join("local")
-        .join("lng")
-        .join("strings");
+    let strings_dir = data_dir.join("local").join("lng").join("strings");
 
     if !strings_dir.exists() {
         // Not an error: just means no strings folder chosen
@@ -296,7 +323,11 @@ fn import_strings_json(conn: &mut Connection, data_dir: &Path) -> Result<(u64, V
             continue;
         }
         let p = entry.path();
-        if p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("json")) != Some(true) {
+        if p.extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("json"))
+            != Some(true)
+        {
             continue;
         }
 
@@ -335,7 +366,12 @@ fn import_strings_json(conn: &mut Connection, data_dir: &Path) -> Result<(u64, V
             let Some(k) = r.key.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
                 continue;
             };
-            let v = r.en_us.as_ref().map(|s| s.as_str()).unwrap_or("").to_string();
+            let v = r
+                .en_us
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
             if stmt.execute([k, v.as_str()]).is_ok() {
                 imported += 1;
             }
@@ -359,7 +395,11 @@ fn detect_delimiter(file_path: &Path) -> Result<u8> {
     if let Some(pos) = sample.iter().position(|b| *b == b'\n') {
         line = &sample[..pos];
     }
-    let line = if line.ends_with(b"\r") { &line[..line.len() - 1] } else { line };
+    let line = if line.ends_with(b"\r") {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
 
     let tabs = line.iter().filter(|b| **b == b'\t').count();
     let commas = line.iter().filter(|b| **b == b',').count();
@@ -370,7 +410,11 @@ fn detect_delimiter(file_path: &Path) -> Result<u8> {
         .max_by_key(|(_d, c)| *c)
         .unwrap();
 
-    Ok(if tabs == 0 && commas == 0 && semis == 0 { b'\t' } else { best })
+    Ok(if tabs == 0 && commas == 0 && semis == 0 {
+        b'\t'
+    } else {
+        best
+    })
 }
 
 fn sanitize_table_name(name: &str) -> String {
@@ -382,10 +426,19 @@ fn sanitize_table_name(name: &str) -> String {
             out.push('_');
         }
     }
-    if out.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if out
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         out = format!("t_{}", out);
     }
-    if out.is_empty() { "table".to_string() } else { out }
+    if out.is_empty() {
+        "table".to_string()
+    } else {
+        out
+    }
 }
 
 fn sanitize_column_name(name: &str) -> String {

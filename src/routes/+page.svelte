@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { open } from "@tauri-apps/plugin-dialog";
 
   // ---------- Tauri invoke ----------
   let invokeCmd: ((cmd: string, args?: any) => Promise<any>) | null = null;
@@ -108,8 +109,12 @@
       return;
     }
     try {
+      const dir = await open({ directory: true, multiple: false });
+      if (!dir) return;
+
       status = "Importing…";
-      await invokeCmd("import_reimagined_data");
+      await invokeCmd("import_reimagined_data", { baseDir: String(dir) });
+
       await refreshTables();
       status = "Import complete ✅";
     } catch (e) {
@@ -159,12 +164,8 @@
       });
 
       // 3) Build column list:
-      //    - start from DB cols
-      //    - hide prop-family later via computeVisibleColumns
-      //    - IMPORTANT: add "mods" if rows include it (it's not in DB schema)
       const colSet = new Set(cols);
       if (!colSet.has("mods")) {
-        // if ANY row has mods, add it
         if (rows.some((r: any) => r && "mods" in r)) colSet.add("mods");
       }
 
@@ -193,7 +194,7 @@
     }
   }
 
-  // ✅ Resolve visible keys via lookup_strings (no special backend command required)
+  // ✅ Resolve visible keys via lookup_strings
   async function resolveVisibleKeys() {
     if (!invokeCmd) {
       status = "Tauri invoke not found. Are you running inside the app?";
@@ -207,16 +208,13 @@
     try {
       status = "Resolving visible keys…";
 
-      // Gather key-like strings from visible columns (excluding mods)
       const keys = new Set<string>();
-
       for (const r of rows) {
         for (const c of visibleColumns) {
           if (c === "mods") continue;
           const v = r?.[c];
           if (typeof v === "string") {
             const s = v.trim();
-            // heuristic: ignore obvious non-keys
             if (!s) continue;
             if (s.length > 80) continue;
             if (/^\d+$/.test(s)) continue;
@@ -230,13 +228,12 @@
         return;
       }
 
-      const locale = "enUS"; // or undefined
+      const locale = "enUS";
       const map: Record<string, string> = await invokeCmd("lookup_strings", {
         keys: Array.from(keys),
         locale
       });
 
-      // Replace values in-place where we have a lookup hit
       rows = rows.map((r) => {
         const nr = { ...r };
         for (const c of visibleColumns) {
@@ -256,14 +253,13 @@
     }
   }
 
-  // Use your existing backend command (debug_table_schema)
   async function debugStringsSchema() {
     if (!invokeCmd) {
       status = "Tauri invoke not found. Are you running inside the app?";
       return;
     }
     try {
-      const cols: string[] = await invokeCmd("debug_table_schema", { table: "strings" });
+      const cols: string[] = await invokeCmd("table_columns", { table: "strings" });
       status = `strings columns: ${cols.join(", ")}`;
     } catch (e) {
       status = `schema error: ${String(e)}`;
