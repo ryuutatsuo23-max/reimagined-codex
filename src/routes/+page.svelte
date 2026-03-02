@@ -280,6 +280,22 @@
       Toggle Compact/Wide
     </button>
 
+    <button on:click={async () => {
+      if (!invokeCmd) {
+        status = "Tauri invoke not ready yet.";
+        return;
+      }
+
+      try {
+        const cols = await invokeCmd("debug_strings_schema");
+        status = `strings columns: ${cols.join(", ")}`;
+      } catch (e) {
+        status = `schema error: ${String(e)}`;
+      }
+    }}>
+      Debug Strings Schema
+    </button>
+
     <span class="pill">Columns: {showAllColumns ? "All" : "Curated"}</span>
     <button
       on:click={() => {

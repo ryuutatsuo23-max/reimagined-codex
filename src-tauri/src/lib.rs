@@ -151,7 +151,7 @@ fn lookup_strings(
     // - try enUS/enus
     // - else try requested locale
     // - else try "value"
-    let want_locale = locale.unwrap_or_else(|| "enUS".to_string());
+    let want_locale = locale.unwrap_or_else(|| "value".to_string());
     let mut candidates = vec![
         "enUS".to_string(),
         "enus".to_string(),
@@ -176,11 +176,10 @@ fn lookup_strings(
         }
     }
     let val_col = val_col.unwrap_or_else(|| {
-        // last resort: if any column besides key exists, use it
         cols.iter()
             .find(|c| !c.eq_ignore_ascii_case(&key_col))
             .cloned()
-            .unwrap_or_else(|| "enUS".to_string())
+            .unwrap_or_else(|| "value".to_string())
     });
 
     // Dedup keys
@@ -415,6 +414,34 @@ fn preview_table(
     Ok(Value::Array(out))
 }
 
+#[tauri::command]
+fn debug_strings_schema(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    use rusqlite::Connection;
+
+    let db_path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("reimagined.sqlite");
+
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(strings);")
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?;
+
+    let mut cols = Vec::new();
+    for r in rows {
+        cols.push(r.map_err(|e| e.to_string())?);
+    }
+
+    Ok(cols)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -427,6 +454,7 @@ pub fn run() {
             table_columns,
             preview_table,
             count_strings,
+            debug_strings_schema,
             lookup_strings
         ])
         .run(tauri::generate_context!())
