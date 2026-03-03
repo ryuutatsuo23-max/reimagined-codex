@@ -40,28 +40,28 @@
     // Curated set
     const baseCompact = [
       "index",
-      "code",
       "lvl",
-      "rarity",
       "lvl_req",
       "itemname",
-      "invfile",
-      "carry1",
-      "cost_add",
-      "cost_mult",
       "mods"
     ];
 
     const baseWideExtra = [
       "id",
       "version",
+      "rarity",
       "disabled",
+      "code",
       "spawnable",
       "firstladderseason",
       "lastladderseason",
       "nolimit",
       "chrtransform",
       "invtransform",
+      "invfile",
+      "carry1",
+      "cost_add",
+      "cost_mult",
       "flippyfile",
       "dropsound",
       "dropsfxframe",

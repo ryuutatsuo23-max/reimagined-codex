@@ -7,10 +7,7 @@ use std::path::PathBuf;
 use tauri::{command, Manager};
 
 fn db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?;
+    let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     Ok(base.join("reimagined.sqlite"))
 }
@@ -38,10 +35,6 @@ fn find_column_case_insensitive(cols: &[String], wanted: &str) -> Option<String>
         .find(|c| c.eq_ignore_ascii_case(wanted))
         .cloned()
 }
-
-// -----------------------------
-// Commands
-// -----------------------------
 
 #[command]
 fn greet(name: &str) -> String {
@@ -106,7 +99,6 @@ fn count_strings(app: tauri::AppHandle) -> Result<i64, String> {
         return Ok(0);
     }
 
-    // strings schema is usually key/value for your importer
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM strings;", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
@@ -131,12 +123,8 @@ fn lookup_strings(
     }
 
     let cols = pragma_table_columns(&conn, "strings").map_err(|e| e.to_string())?;
-
-    // key column
     let key_col = find_column_case_insensitive(&cols, "key").unwrap_or_else(|| "key".to_string());
 
-    // value column (your schema is key/value)
-    // BUT: keep locale support in case you later import wide locale columns
     let want_locale = locale.unwrap_or_else(|| "enUS".to_string());
     let normalized = want_locale
         .chars()
@@ -167,7 +155,6 @@ fn lookup_strings(
             .unwrap_or_else(|| "value".to_string())
     });
 
-    // Dedup keys
     let mut uniq: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for k in keys {
@@ -211,22 +198,22 @@ fn lookup_strings(
 }
 
 // -----------------------------
-// Stat decoding (Option A pass)
+// Stat decoding helpers (Option A / gamer-ish mods)
 // -----------------------------
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Clone, Debug)]
 struct StatCostDef {
-    descstr: Option<String>,
+    descstr: Option<String>, // we'll store descstrpos here (name kept to minimize edits)
     descstrneg: Option<String>,
+    #[allow(dead_code)]
     descfunc: Option<i32>,
+    #[allow(dead_code)]
     descval: Option<i32>,
 }
 
 struct StatDecoder {
-    /// properties.code -> [stat1..statN]
     prop_to_stats: HashMap<String, Vec<String>>,
-    /// itemstatcost.stat -> desc metadata (used more in later passes)
+    prop_tooltip: HashMap<String, String>, // NEW
     #[allow(dead_code)]
     stat_cost: HashMap<String, StatCostDef>,
 }
@@ -235,17 +222,25 @@ impl StatDecoder {
     fn new(conn: &Connection) -> Result<Self, rusqlite::Error> {
         let stat_cost = build_stat_cost(conn).unwrap_or_default();
         let prop_to_stats = build_prop_to_stats(conn).unwrap_or_default();
+        let prop_tooltip = build_prop_tooltip(conn).unwrap_or_default(); // NEW
         Ok(Self {
             prop_to_stats,
+            prop_tooltip,
             stat_cost,
         })
     }
 
-    /// Convert row prop/par/min/max into readable-ish mod strings.
+    /// Convert row prop/par/min/max into gamer-friendly mod strings:
     /// - translates propN -> stat tokens using `properties`
-    /// - prints +X stat or +X-Y stat
+    /// - uses `itemstatcost` desc keys and resolves via `strings` table (key,value)
+    /// - formats %+d / %d placeholders
+    /// - prints +X or +X-Y ranges
     /// - appends (par) when present (later we’ll decode par into real names)
-    fn decode_mods_from_map(&self, row: &Map<String, Value>) -> Vec<String> {
+    fn decode_mods_from_map(
+        &self,
+        row: &Map<String, Value>,
+        strings: &HashMap<String, String>,
+    ) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
 
         let parse_i32 = |s: &str| -> Option<i32> {
@@ -282,36 +277,15 @@ impl StatDecoder {
                 .unwrap_or_else(|| vec![prop.to_string()]);
 
             for stat in stats {
-                let mut line = match (min_i, max_i) {
-                    (Some(a), Some(b)) if a != 0 || b != 0 => {
-                        if a != b {
-                            if a >= 0 && b >= 0 {
-                                format!("+{a}-{b} {stat}")
-                            } else {
-                                format!("{a}-{b} {stat}")
-                            }
-                        } else if a >= 0 {
-                            format!("+{a} {stat}")
-                        } else {
-                            format!("{a} {stat}")
-                        }
+                let mut line = self.format_stat_line(&stat, min_i, max_i, strings);
+
+                // Prefer the gamer-facing tooltip from `properties` when present.
+                // This fixes oskill / nonclassskill lines (e.g. "+# to [Skill]").
+                if let Some(tip) = self.prop_tooltip.get(prop) {
+                    if !tip.trim().is_empty() {
+                        line = format_from_tooltip(tip, par_v, min_i, max_i);
                     }
-                    (Some(a), None) if a != 0 => {
-                        if a >= 0 {
-                            format!("+{a} {stat}")
-                        } else {
-                            format!("{a} {stat}")
-                        }
-                    }
-                    (None, Some(b)) if b != 0 => {
-                        if b >= 0 {
-                            format!("+{b} {stat}")
-                        } else {
-                            format!("{b} {stat}")
-                        }
-                    }
-                    _ => stat.to_string(),
-                };
+                }
 
                 if !par_v.is_empty() {
                     line.push_str(&format!(" ({par_v})"));
@@ -327,6 +301,162 @@ impl StatDecoder {
             out
         }
     }
+
+    fn format_stat_line(
+        &self,
+        stat: &str,
+        min_i: Option<i32>,
+        max_i: Option<i32>,
+        strings: &HashMap<String, String>,
+    ) -> String {
+        // Prefer ranges when both min/max present and different
+        if let (Some(a), Some(b)) = (min_i, max_i) {
+            if a != 0 || b != 0 {
+                if a != b {
+                    // Use description text but remove placeholders (we're showing explicit range)
+                    let desc = self.resolve_desc_text(stat, if b != 0 { b } else { a }, strings);
+                    let clean = strip_placeholders(&desc);
+
+                    return if a >= 0 && b >= 0 {
+                        format!("+{a}-{b} {clean}")
+                    } else {
+                        format!("{a}-{b} {clean}")
+                    };
+                }
+                // If same, treat as single value
+                return self.format_stat_line(stat, Some(a), None, strings);
+            }
+        }
+
+        // Single value
+        let v = min_i.or(max_i).unwrap_or(0);
+        if v == 0 {
+            // Just return the desc without placeholders if any
+            return strip_placeholders(&self.resolve_desc_text(stat, 0, strings));
+        }
+
+        let desc = self.resolve_desc_text(stat, v, strings);
+
+        // If template has placeholders, apply them
+        if desc.contains("%d") || desc.contains("%+d") {
+            return apply_placeholders(&desc, v);
+        }
+
+        // Otherwise fallback to "+v desc"
+        if v >= 0 {
+            format!("+{v} {desc}")
+        } else {
+            format!("{v} {desc}")
+        }
+    }
+
+    fn resolve_desc_text(&self, stat: &str, v: i32, strings: &HashMap<String, String>) -> String {
+        let def = self.stat_cost.get(stat);
+
+        let mut key: Option<&String> = None;
+        if v < 0 {
+            key = def.and_then(|d| d.descstrneg.as_ref());
+        }
+        if key.is_none() {
+            key = def.and_then(|d| d.descstr.as_ref());
+        }
+
+        if let Some(k) = key {
+            if let Some(s) = strings.get(k) {
+                return s.clone();
+            }
+            // fallback: show the key if it isn't found in strings
+            return k.clone();
+        }
+
+        // fallback: raw stat token
+        stat.to_string()
+    }
+}
+/// Load the entire strings table (key,value) into memory for quick lookups.
+fn load_strings_kv(conn: &Connection) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+
+    if table_exists(conn, "strings").ok() != Some(true) {
+        return out;
+    }
+
+    let mut stmt = match conn.prepare("SELECT key, value FROM strings") {
+        Ok(s) => s,
+        Err(_) => return out,
+    };
+
+    let rows = match stmt.query_map([], |r| {
+        let k: Option<String> = r.get(0)?;
+        let v: Option<String> = r.get(1)?;
+        Ok((k.unwrap_or_default(), v.unwrap_or_default()))
+    }) {
+        Ok(it) => it,
+        Err(_) => return out,
+    };
+
+    for row in rows.flatten() {
+        let (k, v) = row;
+        if !k.is_empty() {
+            out.insert(k, v);
+        }
+    }
+
+    out
+}
+
+/// Replace D2 placeholders:
+///  - %d  -> absolute value
+///  - %+d -> signed value
+fn format_from_tooltip(tip: &str, par_v: &str, min_i: Option<i32>, max_i: Option<i32>) -> String {
+    let mut s = tip.to_string();
+
+    if !par_v.is_empty() {
+        s = s.replace("[Skill]", par_v);
+    }
+
+    match (min_i, max_i) {
+        (Some(a), Some(b)) if a != 0 || b != 0 => {
+            if a != b {
+                s = s
+                    .replace("Min #", "")
+                    .replace("Max #", "")
+                    .replace("#", &format!("{a}-{b}"));
+            } else {
+                s = s
+                    .replace("Min #", "")
+                    .replace("Max #", "")
+                    .replace("#", &a.to_string());
+            }
+        }
+        (Some(a), None) if a != 0 => {
+            s = s
+                .replace("Min #", "")
+                .replace("Max #", "")
+                .replace("#", &a.to_string());
+        }
+        (None, Some(b)) if b != 0 => {
+            s = s
+                .replace("Min #", "")
+                .replace("Max #", "")
+                .replace("#", &b.to_string());
+        }
+        _ => {
+            s = s.replace("Min #", "").replace("Max #", "").replace("#", "");
+        }
+    }
+
+    s.trim().to_string()
+}
+
+fn apply_placeholders(template: &str, v: i32) -> String {
+    let signed = v.to_string();
+    let abs = v.abs().to_string();
+    template.replace("%+d", &signed).replace("%d", &abs)
+}
+
+fn strip_placeholders(s: &str) -> String {
+    s.replace("%+d", "").replace("%d", "").trim().to_string()
 }
 
 fn build_stat_cost(conn: &Connection) -> Result<HashMap<String, StatCostDef>, rusqlite::Error> {
@@ -344,7 +474,15 @@ fn build_stat_cost(conn: &Connection) -> Result<HashMap<String, StatCostDef>, ru
         .cloned()
         .unwrap_or_else(|| "stat".to_string());
 
-    let descstr_col = cols.iter().find(|c| c.eq_ignore_ascii_case("descstr")).cloned();
+    // OLD (wrong for your file):
+    // let descstr_col = cols.iter().find(|c| c.eq_ignore_ascii_case("descstr")).cloned();
+
+    // NEW (correct for your file):
+    let descstr_col = cols
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case("descstrpos"))
+        .cloned();
+
     let descstrneg_col = cols
         .iter()
         .find(|c| c.eq_ignore_ascii_case("descstrneg"))
@@ -353,16 +491,20 @@ fn build_stat_cost(conn: &Connection) -> Result<HashMap<String, StatCostDef>, ru
         .iter()
         .find(|c| c.eq_ignore_ascii_case("descfunc"))
         .cloned();
-    let descval_col = cols.iter().find(|c| c.eq_ignore_ascii_case("descval")).cloned();
+    let descval_col = cols
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case("descval"))
+        .cloned();
 
-    let get_opt_string = |r: &Row<'_>, cols: &[String], col_name: &Option<String>| -> Option<String> {
-        col_name.as_ref().and_then(|cn| {
-            cols.iter()
-                .position(|c| c == cn)
-                .and_then(|idx| r.get::<_, Option<String>>(idx).ok())
-                .flatten()
-        })
-    };
+    let get_opt_string =
+        |r: &Row<'_>, cols: &[String], col_name: &Option<String>| -> Option<String> {
+            col_name.as_ref().and_then(|cn| {
+                cols.iter()
+                    .position(|c| c == cn)
+                    .and_then(|idx| r.get::<_, Option<String>>(idx).ok())
+                    .flatten()
+            })
+        };
 
     let get_opt_i32 = |r: &Row<'_>, cols: &[String], col_name: &Option<String>| -> Option<i32> {
         col_name.as_ref().and_then(|cn| {
@@ -373,34 +515,100 @@ fn build_stat_cost(conn: &Connection) -> Result<HashMap<String, StatCostDef>, ru
         })
     };
 
-    let mut stmt = conn.prepare("SELECT * FROM itemstatcost;")?;
-    let mut rows = stmt.query([])?;
+    let sql = format!("SELECT * FROM itemstatcost;");
+    let mut stmt = conn.prepare(&sql)?;
 
-    while let Some(r) = rows.next()? {
-        let stat_idx = cols.iter().position(|c| *c == stat_col).unwrap_or(0);
-        let stat: Option<String> = r.get(stat_idx)?;
-        let stat = match stat {
-            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => continue,
+    let rows = stmt.query_map([], |r| {
+        let stat: Option<String> = r
+            .get(cols.iter().position(|c| c == &stat_col).unwrap_or(0))
+            .ok();
+
+        let stat = stat.unwrap_or_default();
+        let def = StatCostDef {
+            descstr: get_opt_string(r, &cols, &descstr_col),
+            descstrneg: get_opt_string(r, &cols, &descstrneg_col),
+            descfunc: get_opt_i32(r, &cols, &descfunc_col),
+            descval: get_opt_i32(r, &cols, &descval_col),
         };
+        Ok((stat, def))
+    })?;
 
-        stat_cost.insert(
-            stat,
-            StatCostDef {
-                descstr: get_opt_string(r, &cols, &descstr_col),
-                descstrneg: get_opt_string(r, &cols, &descstrneg_col),
-                descfunc: get_opt_i32(r, &cols, &descfunc_col),
-                descval: get_opt_i32(r, &cols, &descval_col),
-            },
-        );
+    for row in rows {
+        let (k, v) = row?;
+        if !k.trim().is_empty() {
+            stat_cost.insert(k.trim().to_string(), v);
+        }
     }
 
     Ok(stat_cost)
 }
 
 fn build_prop_to_stats(conn: &Connection) -> Result<HashMap<String, Vec<String>>, rusqlite::Error> {
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    let mut prop_to_stats: HashMap<String, Vec<String>> = HashMap::new();
 
+    if !table_exists(conn, "properties")? {
+        return Ok(prop_to_stats);
+    }
+
+    let cols = pragma_table_columns(conn, "properties")?;
+
+    let code_col = cols
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case("code"))
+        .cloned()
+        .unwrap_or_else(|| "code".to_string());
+
+    // stat1..stat7 exist in many mods; we’ll pick all we find.
+    let stat_cols: Vec<String> = cols
+        .iter()
+        .filter(|c| c.to_lowercase().starts_with("stat"))
+        .cloned()
+        .collect();
+
+    let sql = format!("SELECT * FROM properties;");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| {
+        let code: Option<String> = r
+            .get(cols.iter().position(|c| c == &code_col).unwrap_or(0))
+            .ok();
+
+        let mut stats: Vec<String> = Vec::new();
+        for sc in &stat_cols {
+            if let Some(idx) = cols.iter().position(|c| c == sc) {
+                let v: Option<String> = r.get(idx).ok();
+                if let Some(v) = v {
+                    let t = v.trim();
+                    if !t.is_empty() {
+                        stats.push(t.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok((code.unwrap_or_default(), stats))
+    })?;
+
+    for row in rows {
+        let (code, stats) = row?;
+        let code = code.trim().to_string();
+        if code.is_empty() {
+            continue;
+        }
+        let stats = stats
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>();
+        if stats.is_empty() {
+            continue;
+        }
+        prop_to_stats.insert(code, stats);
+    }
+
+    Ok(prop_to_stats)
+}
+
+fn build_prop_tooltip(conn: &Connection) -> Result<HashMap<String, String>, rusqlite::Error> {
+    let mut out = HashMap::new();
     if !table_exists(conn, "properties")? {
         return Ok(out);
     }
@@ -413,63 +621,44 @@ fn build_prop_to_stats(conn: &Connection) -> Result<HashMap<String, Vec<String>>
         .cloned()
         .unwrap_or_else(|| "code".to_string());
 
-    let mut stat_cols: Vec<String> = cols
+    // Imported header "*Tooltip" becomes "tooltip" after sanitize
+    let tooltip_col = cols
         .iter()
-        .filter(|c| {
-            let lc = c.to_lowercase();
-            lc.starts_with("stat") && lc.chars().skip(4).all(|ch| ch.is_ascii_digit())
-        })
+        .find(|c| c.eq_ignore_ascii_case("tooltip"))
         .cloned()
-        .collect();
+        .unwrap_or_else(|| "tooltip".to_string());
 
-    stat_cols.sort_by_key(|c| c[4..].parse::<usize>().unwrap_or(999));
-    if stat_cols.is_empty() {
-        return Ok(out);
-    }
+    let sql = "SELECT * FROM properties;";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |r| {
+        let code: Option<String> = r
+            .get(cols.iter().position(|c| c == &code_col).unwrap_or(0))
+            .ok();
+        let tip: Option<String> = r
+            .get(cols.iter().position(|c| c == &tooltip_col).unwrap_or(0))
+            .ok();
+        Ok((code.unwrap_or_default(), tip.unwrap_or_default()))
+    })?;
 
-    let select_cols = std::iter::once(code_col.clone())
-        .chain(stat_cols.clone().into_iter())
-        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let sql = format!("SELECT {select_cols} FROM properties;");
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
-
-    while let Some(r) = rows.next()? {
-        let code: Option<String> = r.get(0)?;
-        let code = match code {
-            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => continue,
-        };
-
-        let mut stats: Vec<String> = Vec::new();
-        for idx in 1..=stat_cols.len() {
-            let s: Option<String> = r.get(idx)?;
-            if let Some(s) = s {
-                let t = s.trim();
-                if !t.is_empty() {
-                    stats.push(t.to_string());
-                }
-            }
-        }
-
-        if !stats.is_empty() {
-            out.insert(code, stats);
+    for row in rows {
+        let (code, tip) = row?;
+        let c = code.trim();
+        let t = tip.trim();
+        if !c.is_empty() && !t.is_empty() {
+            out.insert(c.to_string(), t.to_string());
         }
     }
 
     Ok(out)
 }
 
-// -----------------------------
-// preview_table (inject mods + hide prop/par/min/max)
-// -----------------------------
-
 #[command]
-#[allow(non_snake_case)]
-fn preview_table(app: tauri::AppHandle, table: String, limit: u32, rawProps: bool) -> Result<Value, String> {
+fn preview_table(
+    app: tauri::AppHandle,
+    table: String,
+    limit: u32,
+    rawProps: bool,
+) -> Result<Value, String> {
     let db = db_path(&app)?;
     if !db.exists() {
         return Ok(Value::Array(vec![]));
@@ -490,11 +679,15 @@ fn preview_table(app: tauri::AppHandle, table: String, limit: u32, rawProps: boo
     // Build decoder once per call (fine for now)
     let decoder = StatDecoder::new(&conn).ok();
 
+    // Load strings once (only needed when we inject mods)
+    let strings_kv: HashMap<String, String> = if !rawProps && has_prop_cols {
+        load_strings_kv(&conn)
+    } else {
+        HashMap::new()
+    };
+
     // SELECT * FROM table LIMIT ?
-    let sql = format!(
-        "SELECT * FROM \"{}\" LIMIT ?1;",
-        table.replace('"', "\"\"")
-    );
+    let sql = format!("SELECT * FROM \"{}\" LIMIT ?1;", table.replace('"', "\"\""));
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
     let rows_iter = stmt
@@ -526,7 +719,7 @@ fn preview_table(app: tauri::AppHandle, table: String, limit: u32, rawProps: boo
             if let Value::Object(ref mut obj) = v {
                 if let Some(decoder) = decoder.as_ref() {
                     let mods = decoder
-                        .decode_mods_from_map(obj)
+                        .decode_mods_from_map(obj, &strings_kv)
                         .into_iter()
                         .map(Value::String)
                         .collect::<Vec<_>>();
@@ -553,8 +746,7 @@ fn preview_table(app: tauri::AppHandle, table: String, limit: u32, rawProps: boo
 
 // -----------------------------
 // Tauri run
-// -----------------------------
-
+// --------------------------
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
